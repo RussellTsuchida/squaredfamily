@@ -5,6 +5,8 @@ import pandas as pd
 from matplotlib.patches import Ellipse
 from matplotlib.colors import Normalize
 from scipy.stats import norm as normal_dist  # Avoid naming conflict
+#from sklearn.ensemble import IsolationForest
+from sklearn.covariance import EllipticEnvelope
 
 def plot_cov_ellipse(cov, mean, ax, n_std=2.0, **kwargs):
     """
@@ -23,29 +25,42 @@ def plot_cov_ellipse(cov, mean, ax, n_std=2.0, **kwargs):
 NUM_DATAPOINTS = 1000
 file_path = "params.npy"
 data = np.load(file_path)  # shape [T, d+1] (last col is nlls)
-true_param = data[0, :-1] * (2 * (data[0, 0] > 0) - 1)
+true_param = data[0, :-1] * (2 * (data[0, -2] > 0) - 1)
+
+"""
+iso = IsolationForest(contamination=0.01, random_state=0)
+labels = iso.fit_predict(data[1:,:])          # +1 = inlier, -1 = outlier
+data = np.vstack((data[0,:], data[1:,:][labels == 1]))
+"""
+
+env = EllipticEnvelope(contamination=0.1)
+labels = env.fit_predict(data[1:,:])
+data = np.vstack((data[0,:], data[1:,:][labels == 1]))
+
 nlls = data[1:, -1]
 
 # Filter out possibly bad MLE fits
 idx = np.where(np.isnan(nlls))
 data = np.delete(data, idx[0]+1, axis=0)
 nlls = np.delete(nlls, idx)
-#idx = np.argsort(nlls)[:int(nlls.shape[0]/3)]
+#idx = np.argsort(nlls)[:int(nlls.shape[0]*0.95)]
 #data = data[idx+1,:]
 print(np.max(nlls))
 print(np.min(nlls))
 
 # Preprocessing
 data = data[:, :-1]
-data = data * np.tile(2 * (data[:, 0] > 0) - 1, (data.shape[1], 1)).T
+# Multiply by sign of last dimension to keep signs consistent
+data = data * np.tile(2 * (data[:, -1] > 0) - 1, (data.shape[1], 1)).T
 data = (data[1:, :] - true_param) * np.sqrt(NUM_DATAPOINTS)
+
 
 T, d = data.shape
 df = pd.DataFrame(data, columns=[f"Dim {i+1}" for i in range(d)])
 
 # Load kernel matrix
 K = np.load('kernel.npy')
-Kinv = np.linalg.inv(K) / 4
+Kinv = np.linalg.pinv(K) / 4
 print("Kernel inverse:\n", Kinv)
 print("Shape:", K.shape)
 
@@ -57,10 +72,6 @@ norm = Normalize(vmin=likelihood.min(),
                    vmax=likelihood.max())
 alphas = norm(likelihood)
 print(alphas)
-
-
-
-
 
 
 # --- Create custom pairplot ---

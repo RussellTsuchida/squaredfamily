@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BIAS_SCALE = np.sqrt(0.3)
+BIAS_SCALE = np.sqrt(0.2)
 
 class BiasReparam(torch.nn.Module):
     def __init__(self):
@@ -14,36 +14,155 @@ class BiasReparam(torch.nn.Module):
         return torch.hstack((x, 
                 BIAS_SCALE*torch.ones(x.shape[0], 1, device=device)))
 
-class SquaredFamily(torch.nn.Module):
-    def __init__(self):
+class Psi(torch.nn.Module):
+    def __init__(self, hidden_layer_size, activation='relu'):
         super().__init__()
-        
-        self.hidden_layer_size = 3
+        self.hidden_layer_size = hidden_layer_size
+        self._init_activation(activation)
 
-        self.base_variance = 1
-        self.proposal_variance = 2
-
+        # initialise hidden layer
         self.feature_layer = torch.nn.Sequential(\
                         torch.nn.Linear(2, self.hidden_layer_size-1, device=device,
                                 bias=False),
-                torch.nn.ReLU(),
+                self.activation,
                 BiasReparam())
 
         for param in self.feature_layer.parameters():
             param.requires_grad = False
 
+    def _init_activation(self, activation):
+        self.activation_str = activation
+        if activation == 'relu':
+            self.activation = torch.nn.ReLU()
+        if activation == 'gelu':
+            self.activation = torch.nn.GELU(approximate='none')
+
+    def forward(self, x):
+        return self.feature_layer(x)
+
+    def compute_kernel(self, base_variance):
+        if self.activation_str == 'relu':
+            return self.relu_kernel(base_variance)
+        if self.activation_str == 'gelu':
+            return self.gelu_kernel(base_variance)
+
+    def relu_kernel(self, base_variance):
+        wb = self.feature_layer[0].weight
+
+        inner_products = wb @ wb.T
+        norms = torch.sqrt(torch.diag(inner_products)).reshape((-1,1))
+        norms_outer = norms @ norms.T
+
+        cos = torch.clip(inner_products / norms_outer, -1, 1)
+        sin = torch.clip(torch.sqrt(1 - cos**2), 0, 1)
+        theta = torch.arccos(cos)
+        
+        # Top block of kernel (minus 1 row and 1 column)
+        sub_kernel = norms @ norms.T*base_variance \
+                / (2*np.pi) * (sin + (np.pi - theta) * cos)
+        self.kernel = torch.zeros(sub_kernel.shape[0]+1, sub_kernel.shape[0]+1,
+                                  device = device)
+
+        self.kernel[:-1, :-1] = sub_kernel
+        
+        # Fill in the last row and column
+        # This is the expected value of the ReLU
+        row = np.sqrt(2/np.pi)/2 * \
+                torch.linalg.norm(wb,dim=1).reshape((-1,1))*\
+                np.sqrt(base_variance)
+        self.kernel[:-1, -1] = row.reshape((-1,))*BIAS_SCALE
+        self.kernel[-1, :-1] = row.reshape((-1,))*BIAS_SCALE
+        self.kernel[-1,-1] = BIAS_SCALE**2
+
+        # Check for strict PD
+        eigs = torch.linalg.eigvals(self.kernel)
+        print(torch.min(torch.real(eigs)))
+        return self.kernel
+
+    def gelu_kernel(self, base_variance):
+        _eps = 0#1e-12
+        wb = self.feature_layer[0].weight  # (n, d)
+        inner = wb @ wb.T                   # (n, n) unscaled dot products
+        norms_unscaled = torch.sqrt(torch.diag(inner))   # (n,)
+        norms_unscaled = norms_unscaled.clamp(min=_eps)
+        norms = norms_unscaled.reshape(-1, 1)            # (n,1)
+        norms_outer = norms @ norms.T                    # (n,n)
+
+        # cosine must be unscaled angle cosine
+        cos = torch.clamp(inner / (norms_outer + _eps), -1.0, 1.0)
+        sin = torch.sqrt(torch.clamp(1.0 - cos**2, min=0.0))
+
+        # s1, s2 are sqrt(v_i) = sqrt(base_variance) * ||w_i||
+        s1 = norms * torch.sqrt(torch.tensor(base_variance, device=wb.device, dtype=norms.dtype))
+        s2 = s1.T
+        sprod = s1 * s2       # equals sqrt(v_i) * sqrt(v_j)
+        # denom for any division by s1*s2:
+        denom_sprod = sprod + _eps
+
+        # A = 1 + s1^2 + s2^2 + s1^2 s2^2 sin^2(theta)
+        A = 1.0 + s1**2 + s2**2 + (s1**2) * (s2**2) * (sin**2)
+        sqrtA = torch.sqrt(A.clamp(min=_eps))
+
+        # arctan argument = cos * s1 * s2 / sqrtA
+        atan_arg = (cos * sprod) / sqrtA
+        atan_term = torch.atan(atan_arg)
+
+        # B block
+        cos2 = 2.0 * (cos**2) - 1.0
+        B = 0.5 * (cos2 + 3.0) + s1**2 + s2**2 + (s1**2) * (s2**2) * (sin**2)
+
+        # R term
+        R = (s1**2 * s2**2) * B
+        denom_R = (1.0 + s1**2) * (1.0 + s2**2) * sqrtA + _eps
+        R = R / denom_R
+        R = R / (2.0 * torch.pi)
+
+        # L term
+        L = 0.25 * (sprod * cos)
+
+        # T term: (cos / (s1 s2)) * atan(...)
+        T = (cos * sprod) * atan_term/(2*torch.pi)
+
+        K_block = L + R + T
+
+        n = K_block.shape[0]
+        K = torch.zeros(n + 1, n + 1, device=wb.device, dtype=K_block.dtype)
+        K[:-1, :-1] = K_block
+
+        # Fill bias cross-terms: E[GELU] = v / sqrt(2*pi (1+v)), with v = base_variance * ||w||^2
+        v = base_variance * torch.sum(wb * wb, dim=1)   # shape (n,)
+        row = v / torch.sqrt(2.0 * torch.pi * (1.0 + v))
+
+        K[:-1, -1] = row.reshape(-1) * BIAS_SCALE
+        K[-1, :-1] = row.reshape(-1) * BIAS_SCALE
+        K[-1, -1] = BIAS_SCALE**2
+
+        #eigs = torch.linalg.eigvalsh(K)
+        #print(torch.min(eigs).item())
+        return K
+
+class SquaredFamily(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        self.hidden_layer_size = 3
+        self.base_variance = 1.
+        self.proposal_variance = 2.
+
+        self.psi = Psi(self.hidden_layer_size, 'gelu')
+        
         self.param_layer = torch.nn.Linear(self.hidden_layer_size, 1, bias=False, 
                                             device=device)
 
-        self.compute_kernel()
-
+        self.kernel = self.psi.compute_kernel(self.base_variance)
         print(self.kernel)
-        print(torch.linalg.inv(self.kernel))
+        print(torch.linalg.pinv(self.kernel))
 
     def normalise_param_layer(self):
         with torch.no_grad():
             param = self.param_layer.weight
             param = param / torch.sqrt(self.normalising_constant())
+            param = param * torch.sign(param[0,-1])
             self.param_layer.weight = torch.nn.Parameter(param)
 
 
@@ -54,11 +173,12 @@ class SquaredFamily(torch.nn.Module):
             if not (param is None):
                 self.param_layer.weight = torch.nn.Parameter(param)
 
-        for param in self.feature_layer.parameters():
+        for param in self.psi.feature_layer.parameters():
             param.requires_grad = False
 
     def forward(self, x, dimension_augmentation = False, a = None):
-        psi = self.feature_layer(x)
+        #psi = self.feature_layer(x)
+        psi = self.psi(x)
         lin = self.param_layer(psi)
 
         den = self.normalising_constant()
@@ -74,53 +194,24 @@ class SquaredFamily(torch.nn.Module):
         else:
             aug_density = 0
         
-        
+        #if dimension_augmentation: 
+        #    return aug_density
+
         return torch.log(lin**2)-torch.log(den)+base_density.reshape((-1,1))+\
                 aug_density
+
+
 
     def normalising_constant(self):
         return torch.sum(
                 (self.param_layer.weight.T @ self.param_layer.weight)*
                 self.kernel)
 
-
-    def compute_kernel(self):
-        wb = self.feature_layer[0].weight
-
-        inner_products = wb @ wb.T
-        norms = torch.sqrt(torch.diag(inner_products)).reshape((-1,1))
-        norms_outer = norms @ norms.T
-
-        cos = torch.clip(inner_products / norms_outer, -1, 1)
-        sin = torch.clip(torch.sqrt(1 - cos**2), 0, 1)
-        theta = torch.arccos(cos)
-        
-        # Top block of kernel (minus 1 row and 1 column)
-        sub_kernel = norms @ norms.T*self.base_variance \
-                / (2*np.pi) * (sin + (np.pi - theta) * cos)
-        self.kernel = torch.zeros(sub_kernel.shape[0]+1, sub_kernel.shape[0]+1,
-                                  device = device)
-
-        self.kernel[:-1, :-1] = sub_kernel
-        
-        # Fill in the last row and column
-        # This is the expected value of the ReLU
-        row = np.sqrt(2/np.pi)/2 * \
-                torch.linalg.norm(wb,dim=1).reshape((-1,1))*\
-                np.sqrt(self.base_variance)
-        self.kernel[:-1, -1] = row.reshape((-1,))*BIAS_SCALE
-        self.kernel[-1, :-1] = row.reshape((-1,))*BIAS_SCALE
-        self.kernel[-1,-1] = BIAS_SCALE**2
-
-        # Check for strict PD
-        #eigs = torch.linalg.eigvals(self.kernel)
-        #print(torch.min(torch.real(eigs)))
-
     def _sample(self, num_samples):
         with torch.no_grad():
             # Compute the bound on the likelihood ratio
             s = self.base_variance**-1 - self.proposal_variance**-1
-            _, sval, _ = torch.linalg.svd(self.feature_layer[0].weight)
+            _, sval, _ = torch.linalg.svd(self.psi.feature_layer[0].weight)
             w = sval[0]
 
             den = self.normalising_constant()
@@ -161,7 +252,7 @@ class SquaredFamily(torch.nn.Module):
 
     def rayleigh_estimate(self, data):         
         with torch.no_grad():
-            psi = self.feature_layer(data).unsqueeze(2)
+            psi = self.psi(data).unsqueeze(2)
 
             den = self.normalising_constant()
 
@@ -170,7 +261,7 @@ class SquaredFamily(torch.nn.Module):
                     data.shape[1]/2*np.log(self.base_variance))).\
                     reshape((-1,1,1)).tile((1,psi.shape[1],psi.shape[1]))
             
-            psi_psit = (torch.bmm(psi, torch.transpose(psi, 1, 2)))
+            psi_psit = (torch.bmm(psi, torch.transpose(psi, 1, 2))) 
 
             mid_fac = torch.mean(torch.exp(base_density) * psi_psit, dim=0)
             L = torch.linalg.cholesky(self.kernel)
@@ -179,17 +270,17 @@ class SquaredFamily(torch.nn.Module):
 
             param = torch.linalg.inv(L).T @ vmax
             param = param / torch.sqrt(self.normalising_constant())
+            #param = param * 1
             self.param_layer.weight = torch.nn.Parameter(param.T)
-        
 
 
 if __name__ == '__main__':
     import scipy.integrate as integrate
     NUM_TRIALS = 500        # Number of times to attempt to solve MLE
     NUM_SAMPLES = 1000      # Number of samples for fitting MLE
-    num_epochs = 100        # Number of training epochs
+    num_epochs = 500        # Number of training epochs
 
-    torch.manual_seed(0)
+    torch.manual_seed(2)
     density = SquaredFamily() 
     density.normalise_param_layer()
     true_params = density.param_layer.weight
@@ -246,7 +337,6 @@ if __name__ == '__main__':
     # different data
     mle_params = torch.zeros(NUM_TRIALS+1, 
                              density.hidden_layer_size+1, device=device)
-    print(true_params[0].detach().cpu().numpy())
     for t in range(1,NUM_TRIALS+1):
         density.reinitialise_param_layer(true_params)
         x_train = density.sample(NUM_SAMPLES)
@@ -259,7 +349,7 @@ if __name__ == '__main__':
         x_train = torch.tensor(x_train, dtype=torch.float32, device=device)
 
         # Set up the optimizer
-        optimizer = torch.optim.Adam(density.param_layer.parameters(), lr=0.01)
+        optimizer = torch.optim.Adam(density.param_layer.parameters(), lr=0.1)
 
         for epoch in range(num_epochs):
             optimizer.zero_grad()
@@ -271,16 +361,15 @@ if __name__ == '__main__':
             train_loss.backward()
             optimizer.step()
         
-        print(t)
+        print("Completed " + str(t) + " out of " + str(NUM_TRIALS) + " MLE fits.")
         #print(density.param_layer.weight[0].detach().cpu().numpy())
         #print(train_loss.item())
         #print(density.normalising_constant())
         #plot_density(str(t) + '.png', x_train)
-        mle_params[t,:-1] = density.param_layer.weight \
-                / torch.sqrt(density.normalising_constant())
+        mle_params[t,:-1] = density.param_layer.weight #\
+        #/ torch.sqrt(density.normalising_constant())
 
         mle_params[t,-1] = train_loss.item()
-        print(density.normalising_constant())
     
     density.eval()
     mle_params[0,:-1] = true_params
