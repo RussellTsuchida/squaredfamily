@@ -277,10 +277,10 @@ class SquaredFamily(torch.nn.Module):
 if __name__ == '__main__':
     import scipy.integrate as integrate
     NUM_TRIALS = 500        # Number of times to attempt to solve MLE
-    NUM_SAMPLES = 1000      # Number of samples for fitting MLE
+    NUM_SAMPLES = 10000      # Number of samples for fitting MLE
     num_epochs = 500        # Number of training epochs
 
-    torch.manual_seed(2)
+    torch.manual_seed(0)
     density = SquaredFamily() 
     density.normalise_param_layer()
     true_params = density.param_layer.weight

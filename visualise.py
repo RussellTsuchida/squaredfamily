@@ -22,7 +22,7 @@ def plot_cov_ellipse(cov, mean, ax, n_std=2.0, **kwargs):
     ax.add_patch(ellipse)
 
 # --- Setup ---
-NUM_DATAPOINTS = 1000
+NUM_DATAPOINTS = 10000
 file_path = "params.npy"
 data = np.load(file_path)  # shape [T, d+1] (last col is nlls)
 true_param = data[0, :-1] * (2 * (data[0, -2] > 0) - 1)
